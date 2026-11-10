@@ -1,0 +1,35 @@
+[package]
+name = "imagesort"
+version = "0.1.0"
+edition = "2021"
+description = "Tri rapide d'images vers des répertoires, plein écran, avec préchargement"
+
+[lib]
+name = "imagesort"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ImageSort"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico", "pnm", "tga"] }
+fast_image_resize = "6"
+egui = "0.37"
+trash = "5"
+rfd = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+strip = true
+
+# Les décodeurs d'images sont aussi utilisés par les tests : on les optimise même en debug.
+[profile.dev.package."*"]
+opt-level = 3
