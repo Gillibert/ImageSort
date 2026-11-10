@@ -32,12 +32,14 @@ fn main() {
         }
     };
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("ImageSort — {}", root.display()))
-            .with_fullscreen(true),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("ImageSort — {}", root.display()))
+        .with_fullscreen(true);
+    // Icône de la fenêtre (celle de l'exe est embarquée par build.rs).
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     if let Err(e) = eframe::run_native("ImageSort", options, Box::new(move |cc| Ok(Box::new(SorterApp::new(&cc.egui_ctx, session))))) {
         error_box(&format!("Erreur d'affichage : {e}"));

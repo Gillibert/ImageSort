@@ -41,18 +41,11 @@ pub fn decode_fit(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, String
     // Lecture complète puis décodage en mémoire : le fichier n'est ouvert que
     // quelques millisecondes, ce qui évite de bloquer son déplacement (Windows).
     let bytes = fs::read(path).map_err(|e| format!("lecture impossible : {e}"))?;
-    let mut reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| format!("format inconnu : {e}"))?;
-    if reader.format().is_none() {
-        // Formats sans signature (ex. TGA) : on se rabat sur l'extension.
-        if let Ok(f) = image::ImageFormat::from_path(path) {
-            reader.set_format(f);
-        }
-    }
-    let mut decoder = reader.into_decoder().map_err(|e| format!("format non pris en charge : {e}"))?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let img = DynamicImage::from_decoder(decoder).map_err(|e| format!("décodage impossible : {e}"))?;
+    let (img, orientation) = if is_avif(&bytes) {
+        (decode_avif(&bytes)?, Orientation::NoTransforms)
+    } else {
+        decode_with_image_crate(bytes, path)?
+    };
 
     let (sw, sh) = (img.width(), img.height());
     let (ow, oh) = if swaps_axes(orientation) { (sh, sw) } else { (sw, sh) };
@@ -69,6 +62,102 @@ pub fn decode_fit(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, String
     let (buf, w, h) = orient(buf, rw, rh, has_alpha, orientation)?;
     let rgba = if has_alpha { buf } else { rgb_to_rgba(&buf) };
     Ok(Decoded { width: w, height: h, orig_width: ow, orig_height: oh, rgba })
+}
+
+/// Formats gérés par la crate `image` (JPEG, PNG, WebP…), avec l'orientation EXIF.
+fn decode_with_image_crate(bytes: Vec<u8>, path: &Path) -> Result<(DynamicImage, Orientation), String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("format inconnu : {e}"))?;
+    if reader.format().is_none() {
+        // Formats sans signature (ex. TGA) : on se rabat sur l'extension.
+        if let Ok(f) = image::ImageFormat::from_path(path) {
+            reader.set_format(f);
+        }
+    }
+    let mut decoder = reader.into_decoder().map_err(|e| format!("format non pris en charge : {e}"))?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let img = DynamicImage::from_decoder(decoder).map_err(|e| format!("décodage impossible : {e}"))?;
+    Ok((img, orientation))
+}
+
+/// `true` si le contenu est un fichier AVIF (boîte `ftyp` de marque `avif`/`avis`).
+pub fn is_avif(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    // Marque principale, puis marques compatibles (dans la boîte ftyp, au début du fichier).
+    let box_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let end = box_len.clamp(12, bytes.len().min(256));
+    let brands = &bytes[8..end];
+    // 8..12 = marque principale ; 12..16 = version ; ensuite les marques compatibles.
+    let major = &brands[..4.min(brands.len())];
+    let compat = brands.get(8..).unwrap_or(&[]);
+    major == b"avif" || major == b"avis" || compat.chunks_exact(4).any(|b| b == b"avif" || b == b"avis")
+}
+
+/// Décode un AVIF (AV1) en image 8 bits. Les profondeurs 10/12 bits sont ramenées à 8 bits.
+/// Limite : la rotation/le miroir du conteneur (`irot`/`imir`) ne sont pas appliqués.
+fn decode_avif(bytes: &[u8]) -> Result<DynamicImage, String> {
+    use avif_decode::Image as A;
+    let err = |what: &str| format!("AVIF : {what}");
+    let image = avif_decode::Decoder::from_avif(bytes)
+        .and_then(|d| d.to_image())
+        .map_err(|e| err(&e.to_string()))?;
+
+    let invalid = || err("tampon d'image invalide");
+    Ok(match image {
+        A::Rgb8(i) => {
+            let (w, h) = (i.width() as u32, i.height() as u32);
+            let mut v = Vec::with_capacity(w as usize * h as usize * 3);
+            for p in i.pixels() {
+                v.extend_from_slice(&[p.r, p.g, p.b]);
+            }
+            DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, v).ok_or_else(invalid)?)
+        }
+        A::Rgb16(i) => {
+            let (w, h) = (i.width() as u32, i.height() as u32);
+            let mut v = Vec::with_capacity(w as usize * h as usize * 3);
+            for p in i.pixels() {
+                v.extend_from_slice(&[(p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8]);
+            }
+            DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, v).ok_or_else(invalid)?)
+        }
+        A::Rgba8(i) => {
+            let (w, h) = (i.width() as u32, i.height() as u32);
+            let mut v = Vec::with_capacity(w as usize * h as usize * 4);
+            for p in i.pixels() {
+                v.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+            }
+            DynamicImage::ImageRgba8(RgbaImage::from_raw(w, h, v).ok_or_else(invalid)?)
+        }
+        A::Rgba16(i) => {
+            let (w, h) = (i.width() as u32, i.height() as u32);
+            let mut v = Vec::with_capacity(w as usize * h as usize * 4);
+            for p in i.pixels() {
+                v.extend_from_slice(&[(p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8, (p.a >> 8) as u8]);
+            }
+            DynamicImage::ImageRgba8(RgbaImage::from_raw(w, h, v).ok_or_else(invalid)?)
+        }
+        A::Gray8(i) => {
+            let (w, h) = (i.width() as u32, i.height() as u32);
+            let mut v = Vec::with_capacity(w as usize * h as usize * 3);
+            for p in i.pixels() {
+                let g = p.value();
+                v.extend_from_slice(&[g, g, g]);
+            }
+            DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, v).ok_or_else(invalid)?)
+        }
+        A::Gray16(i) => {
+            let (w, h) = (i.width() as u32, i.height() as u32);
+            let mut v = Vec::with_capacity(w as usize * h as usize * 3);
+            for p in i.pixels() {
+                let g = (p.value() >> 8) as u8;
+                v.extend_from_slice(&[g, g, g]);
+            }
+            DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, v).ok_or_else(invalid)?)
+        }
+    })
 }
 
 fn resize(buf: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32, pt: PixelType) -> Result<Vec<u8>, String> {
@@ -227,6 +316,81 @@ mod tests {
         assert_eq!(flipped, vec![0, 0, 255, 255, 0, 0]);
     }
 
+    // Fixtures générées une fois pour toutes avec `ravif` (voir tests/data/README.md).
+    const GRADIENT_AVIF: &[u8] = include_bytes!("../tests/data/gradient.avif");
+    const ALPHA_AVIF: &[u8] = include_bytes!("../tests/data/alpha.avif");
+
+    fn close(a: u8, b: u8, tol: i32) -> bool {
+        (a as i32 - b as i32).abs() <= tol
+    }
+
+    #[test]
+    fn application_icon_is_a_valid_multi_size_ico() {
+        let ico = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("icon.ico");
+        let d = decode_fit(&ico, 4096, 4096).unwrap(); // le décodeur ICO retient la plus grande taille
+        assert_eq!((d.width, d.height), (256, 256));
+        let entries = u16::from_le_bytes([fs::read(&ico).unwrap()[4], 0]);
+        assert_eq!(entries, 7);
+    }
+
+    #[test]
+    fn avif_signature_detection() {
+        assert!(is_avif(GRADIENT_AVIF));
+        assert!(is_avif(ALPHA_AVIF));
+        assert!(!is_avif(b""));
+        assert!(!is_avif(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"));
+        assert!(!is_avif(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1]));
+        // HEIC (autre marque ftyp) : pas de l'AVIF.
+        assert!(!is_avif(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"));
+        // Marque principale quelconque mais « avif » parmi les marques compatibles.
+        assert!(is_avif(b"\0\0\0\x18ftypmif1\0\0\0\0mif1avif"));
+    }
+
+    #[test]
+    fn decodes_avif_with_correct_colors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gradient.avif");
+        fs::write(&path, GRADIENT_AVIF).unwrap();
+        let d = decode_fit(&path, 4096, 4096).unwrap();
+        assert_eq!((d.width, d.height), (64, 48));
+        let (tl, tr, bl) = (px(&d, 0, 0), px(&d, 63, 0), px(&d, 0, 47));
+        assert!(close(tl[0], 0, 12) && close(tl[1], 0, 12) && close(tl[2], 128, 12), "{tl:?}");
+        assert!(close(tr[0], 255, 12) && close(tr[1], 0, 12), "{tr:?}");
+        assert!(close(bl[0], 0, 12) && close(bl[1], 255, 12), "{bl:?}");
+        assert_eq!(tl[3], 255);
+    }
+
+    #[test]
+    fn decodes_avif_alpha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("alpha.avif");
+        fs::write(&path, ALPHA_AVIF).unwrap();
+        let d = decode_fit(&path, 4096, 4096).unwrap();
+        assert_eq!((d.width, d.height), (32, 32));
+        let p = px(&d, 10, 10);
+        assert!(close(p[0], 200, 8) && close(p[1], 100, 8) && close(p[2], 50, 8) && close(p[3], 128, 4), "{p:?}");
+    }
+
+    #[test]
+    fn avif_is_downscaled_and_detected_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("disguised.jpg"); // mauvaise extension
+        fs::write(&path, GRADIENT_AVIF).unwrap();
+        let d = decode_fit(&path, 32, 32).unwrap();
+        assert_eq!((d.width, d.height), (32, 24));
+        assert_eq!((d.orig_width, d.orig_height), (64, 48));
+    }
+
+    #[test]
+    fn truncated_avif_is_an_error_not_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        for cut in [GRADIENT_AVIF.len() / 2, 40, 12] {
+            let path = tmp.path().join(format!("cut{cut}.avif"));
+            fs::write(&path, &GRADIENT_AVIF[..cut]).unwrap();
+            assert!(decode_fit(&path, 100, 100).is_err(), "coupé à {cut} octets");
+        }
+    }
+
     /// Mesure indicative : `cargo test --release -- --ignored --nocapture bench_decode`
     #[test]
     #[ignore]
@@ -249,6 +413,21 @@ mod tests {
             decode_fit(&path, 1920, 1080).unwrap();
         }
         println!("JPEG 4000x3000 ({} Mo) -> 1920x1080 : {:?} par image", size / 1_000_000, start.elapsed() / runs);
+    }
+
+    /// `IMAGESORT_BENCH_AVIF=chemin.avif cargo test --release --lib -- --ignored --nocapture bench_decode_avif`
+    #[test]
+    #[ignore]
+    fn bench_decode_avif() {
+        let Ok(path) = std::env::var("IMAGESORT_BENCH_AVIF") else {
+            println!("IMAGESORT_BENCH_AVIF non défini : rien à mesurer");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let _ = decode_fit(&path, 1920, 1080).unwrap();
+        let start = std::time::Instant::now();
+        let d = decode_fit(&path, 1920, 1080).unwrap();
+        println!("AVIF {}x{} -> {}x{} : {:?}", d.orig_width, d.orig_height, d.width, d.height, start.elapsed());
     }
 
     #[test]

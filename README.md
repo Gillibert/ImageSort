@@ -38,8 +38,18 @@ Si un fichier du même nom existe déjà dans le répertoire cible, l'image est 
 
 ## Formats
 
-JPEG (jpg, jpeg, jpe, jfif), PNG, WebP, GIF (1ʳᵉ image), BMP, TIFF, ICO, TGA, PNM.
+JPEG (jpg, jpeg, jpe, jfif), PNG, WebP, **AVIF**, GIF (1ʳᵉ image), BMP, TIFF, ICO, TGA, PNM.
 L'orientation EXIF est respectée ; le format est reconnu d'après le contenu du fichier.
+
+AVIF : décodage 100 % Rust (`rav1d` via `avif-decode`, copie locale dans `vendor/avif-decode`
+dont seul `Cargo.toml` est modifié pour ne pas exiger NASM à la compilation). Les images 10/12 bits
+sont ramenées à 8 bits ; la rotation/miroir du conteneur AVIF (`irot`/`imir`) n'est pas appliquée.
+Mesure : AVIF 3000×2000 → 1620×1080 en ≈ 100 ms.
+
+## Icône
+
+`assets/icon.ico` (embarquée dans l'exe par `build.rs`) et `assets/icon.png` (icône de la fenêtre)
+sont générées par `tools/make_icon.ps1` : une photo qui glisse dans un dossier, avec une touche « A ».
 
 ## Performances
 

@@ -1,0 +1,2 @@
+// Icône de l'exécutable (Explorateur, barre des tâches, Alt+Tab). Régénérer avec tools\make_icon.ps1.
+1 ICON "icon.ico"

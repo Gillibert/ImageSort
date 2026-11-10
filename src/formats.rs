@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// Extensions (en minuscules) des formats que l'on sait décoder.
 pub const EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "jfif", "png", "webp", "gif", "bmp", "dib", "tif", "tiff", "ico", "tga",
+    "jpg", "jpeg", "jpe", "jfif", "png", "webp", "avif", "gif", "bmp", "dib", "tif", "tiff", "ico", "tga",
     "pbm", "pgm", "ppm", "pnm",
 ];
 
@@ -26,7 +26,7 @@ mod tests {
     #[test]
     fn recognises_common_formats_case_insensitively() {
         for name in [
-            "a.jpg", "a.JPG", "a.jpeg", "a.Png", "a.webp", "a.WEBP", "a.gif", "a.bmp", "a.tif",
+            "a.jpg", "a.JPG", "a.jpeg", "a.Png", "a.webp", "a.WEBP", "a.avif", "a.AVIF", "a.gif", "a.bmp", "a.tif",
             "a.TIFF", "dir.x/b.png",
         ] {
             assert!(is_image_path(Path::new(name)), "{name} devrait être reconnu");

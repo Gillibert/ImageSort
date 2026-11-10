@@ -273,6 +273,19 @@ fn empty_folder_and_missing_subfolders_do_not_crash() {
 }
 
 #[test]
+fn avif_images_are_listed_displayed_and_sorted() {
+    let mut h = Harness::new(0);
+    let avif = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("gradient.avif");
+    fs::copy(&avif, h.root.join("photo.avif")).unwrap();
+    let trash = FolderTrash { dir: h.root.parent().unwrap().join("trash"), log: Default::default() };
+    h.app = SorterApp::new(&h.ctx, Session::open(&h.root, Box::new(trash)).unwrap());
+    assert_eq!(h.app.session().len(), 1);
+    h.wait_until("décodage AVIF", |a| a.current_ready());
+    h.press(Key::A);
+    assert_eq!(h.names(&h.root.join("Alice")), vec!["photo.avif"]);
+}
+
+#[test]
 fn corrupt_image_can_still_be_sorted() {
     let mut h = Harness::new(2);
     fs::write(h.root.join("img00.jpg"), b"pas une image").unwrap();
