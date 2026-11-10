@@ -9,7 +9,8 @@
 //! - [`session`] : état du tri (déplacement, suppression, annulation) ;
 //! - [`prefetch`]: préchargement multi-thread ;
 //! - [`decode`]  : décodage + réduction à la taille de l'écran ;
-//! - [`view`]    : géométrie d'affichage.
+//! - [`view`]    : géométrie d'affichage ;
+//! - [`settings`]: taille/position de la fenêtre mémorisées entre deux lancements.
 
 pub mod app;
 pub mod decode;
@@ -19,4 +20,5 @@ pub mod natural;
 pub mod prefetch;
 pub mod scan;
 pub mod session;
+pub mod settings;
 pub mod view;

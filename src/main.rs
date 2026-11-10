@@ -3,6 +3,7 @@
 
 use imagesort::app::SorterApp;
 use imagesort::session::{RecycleBin, Session};
+use imagesort::settings::WindowSettings;
 use std::path::PathBuf;
 
 fn error_box(msg: &str) {
@@ -32,16 +33,39 @@ fn main() {
         }
     };
 
+    // Taille/position de la fenêtre du dernier lancement (réglage global).
+    let settings_path = WindowSettings::default_path();
+    let settings = settings_path.as_deref().map(WindowSettings::load).unwrap_or_default();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("ImageSort — {}", root.display()))
-        .with_fullscreen(true);
+        .with_min_inner_size([320.0, 240.0])
+        .with_fullscreen(settings.fullscreen)
+        .with_maximized(settings.maximized && !settings.fullscreen);
+    // Taille et position ne s'appliquent qu'en mode fenêtré : fournies à la création d'une fenêtre
+    // plein écran, elles la font s'ouvrir en fenêtre. (F11 y revient : voir `SorterApp`.)
+    if !settings.fullscreen {
+        if let Some((w, h)) = settings.size {
+            viewport = viewport.with_inner_size([w, h]);
+        }
+        if let Some((x, y)) = settings.startup_position() {
+            viewport = viewport.with_position([x, y]);
+        }
+    }
     // Icône de la fenêtre (celle de l'exe est embarquée par build.rs).
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
 
-    if let Err(e) = eframe::run_native("ImageSort", options, Box::new(move |cc| Ok(Box::new(SorterApp::new(&cc.egui_ctx, session))))) {
+    let creator: eframe::AppCreator<'_> = Box::new(move |cc| {
+        let mut app = SorterApp::new(&cc.egui_ctx, session);
+        if let Some(path) = settings_path {
+            app.remember_window(path, settings);
+        }
+        Ok(Box::new(app))
+    });
+    if let Err(e) = eframe::run_native("ImageSort", options, creator) {
         error_box(&format!("Erreur d'affichage : {e}"));
     }
 }

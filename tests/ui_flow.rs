@@ -63,11 +63,19 @@ impl Harness {
     }
 
     fn frame(&mut self, events: Vec<Event>) {
-        let raw = RawInput {
+        self.frame_with_viewport(events, None);
+    }
+
+    /// Un cadre dont l'état de la fenêtre (taille, plein écran…) est celui donné.
+    fn frame_with_viewport(&mut self, events: Vec<Event>, viewport: Option<egui::ViewportInfo>) {
+        let mut raw = RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0))),
             events,
             ..Default::default()
         };
+        if let Some(info) = viewport {
+            raw.viewports.insert(egui::ViewportId::ROOT, info);
+        }
         let app = &mut self.app;
         let mut output = self.ctx.run_ui(raw, |ui| {
             let ctx = ui.ctx().clone();
@@ -299,3 +307,107 @@ fn corrupt_image_can_still_be_sorted() {
     assert!(h.names(&h.root.join("Eve")).contains(&"img00.jpg".to_string()));
 }
 
+
+#[test]
+fn arrow_up_sends_the_image_to_the_parent_folder_and_z_brings_it_back() {
+    let mut h = Harness::new(4);
+    h.wait_until("première image", |a| a.current_ready());
+    let parent = h.root.parent().unwrap().to_path_buf();
+
+    h.press(Key::ArrowUp);
+    assert_eq!(h.current_stem(), "img02", "l'image suivante est affichée");
+    assert_eq!(h.names(&parent), vec!["img01.jpg"]);
+    assert!(!h.root.join("img01.jpg").exists());
+    assert!(h.app.status_text().is_some_and(|s| s.contains("parent")), "{:?}", h.app.status_text());
+
+    // Mélange avec une lettre, puis annulation dans l'ordre inverse.
+    h.press(Key::A);
+    h.press(Key::ArrowUp);
+    assert_eq!(h.names(&parent), vec!["img01.jpg", "img03.png"]);
+    assert_eq!(h.current_stem(), "img04");
+    h.press(Key::Z);
+    assert_eq!(h.current_stem(), "img03");
+    assert_eq!(h.names(&parent), vec!["img01.jpg"]);
+    h.press(Key::Z);
+    h.press(Key::Z);
+    assert_eq!(h.current_stem(), "img01");
+    assert!(h.names(&parent).is_empty());
+    assert_eq!(h.app.session().len(), 4);
+}
+
+#[test]
+fn holding_arrow_up_moves_only_one_image() {
+    let mut h = Harness::new(5);
+    h.wait_until("première image", |a| a.current_ready());
+    h.hold(Key::ArrowUp, 6);
+    h.release(Key::ArrowUp);
+    assert_eq!(h.names(h.root.parent().unwrap().to_path_buf().as_path()), vec!["img01.jpg"]);
+    assert_eq!(h.app.session().len(), 4);
+}
+
+#[test]
+fn window_size_and_position_are_remembered_in_the_settings_file() {
+    use imagesort::settings::WindowSettings;
+    let mut h = Harness::new(1);
+    let file = h.root.parent().unwrap().join("cfg").join("settings.txt");
+    h.app.remember_window(file.clone(), WindowSettings::default());
+
+    // Rien d'observé : rien n'est modifié ni écrit.
+    h.frame(vec![]);
+    assert_eq!(h.app.window_settings(), Some(&WindowSettings::default()));
+    assert!(!file.exists());
+
+    // L'utilisateur quitte le plein écran (F11) et redimensionne la fenêtre.
+    let info = egui::ViewportInfo {
+        fullscreen: Some(false),
+        maximized: Some(false),
+        minimized: Some(false),
+        inner_rect: Some(Rect::from_min_size(egui::pos2(120.0, 90.0), egui::vec2(1100.0, 750.0))),
+        outer_rect: Some(Rect::from_min_size(egui::pos2(112.0, 59.0), egui::vec2(1118.0, 797.0))),
+        monitor_size: Some(egui::vec2(1920.0, 1080.0)),
+        native_pixels_per_point: Some(1.0),
+        ..Default::default()
+    };
+    h.frame_with_viewport(vec![], Some(info));
+    let s = h.app.window_settings().unwrap().clone();
+    assert!(!s.fullscreen);
+    assert_eq!(s.size, Some((1100.0, 750.0)));
+    assert_eq!(s.pos, Some((112.0, 59.0)));
+
+    // À la fermeture, tout est écrit ; le lancement suivant relit la même chose.
+    h.app.save_window_now();
+    assert_eq!(WindowSettings::load(&file), s);
+}
+
+#[test]
+fn without_remember_window_nothing_is_written() {
+    let mut h = Harness::new(1);
+    assert!(h.app.window_settings().is_none());
+    h.app.save_window_now(); // sans effet
+    h.frame(vec![]);
+}
+
+#[test]
+fn every_displayed_text_is_covered_by_the_fonts() {
+    // Les polices d'egui n'ont pas les flèches : un caractère absent s'afficherait en carré.
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(RawInput::default(), |_| {}); // initialise les polices
+    out.textures_delta.clear();
+    let font = egui::FontId::proportional(20.0);
+    for text in imagesort::app::texts::all_samples() {
+        let missing: Vec<char> = text.chars().filter(|&c| !ctx.fonts_mut(|f| f.has_glyph(&font, c))).collect();
+        assert!(missing.is_empty(), "caractères absents des polices {missing:?} dans « {text} »");
+    }
+}
+
+#[test]
+fn the_fonts_really_lack_arrows_so_the_coverage_test_is_meaningful() {
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(RawInput::default(), |_| {});
+    out.textures_delta.clear();
+    let font = egui::FontId::proportional(20.0);
+    for c in ['←', '→', '↑'] {
+        assert!(!ctx.fonts_mut(|f| f.has_glyph(&font, c)), "{c} est présent : le test de couverture ne détecterait rien");
+    }
+    assert!(ctx.fonts_mut(|f| f.has_glyph(&font, 'é')));
+}

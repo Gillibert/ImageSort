@@ -23,6 +23,7 @@ ImageSort.exe "C:\chemin\TOSORT"
 | `←` / `→` (ou PgUp / PgDn) | image précédente / suivante (la touche maintenue défile) |
 | `Home` / `End` | première / dernière image |
 | `A`, `B`, `C`… | déplace l'image dans le répertoire du bouton correspondant (ordre alphabétique) puis affiche la suivante |
+| `↑` | envoie l'image dans le **dossier parent** du dossier trié (en triant `TRUC\Tosort`, elle va dans `TRUC`), puis affiche la suivante |
 | `F1`…`F10` | répertoires n° 26 à 35 (les lettres `A`–`Y` couvrent les 25 premiers ; `Z` est réservée) |
 | `Z` | annule la dernière action ; plusieurs appuis remontent dans l'historique |
 | `Suppr` | met l'image à la corbeille Windows (annulable avec `Z`) |
@@ -30,8 +31,20 @@ ImageSort.exe "C:\chemin\TOSORT"
 | `F11` | plein écran / fenêtre |
 | `Échap` | quitter |
 
-Les boutons sont aussi cliquables à la souris. Maintenir une lettre ou `Suppr` n'agit qu'une fois
-(pas de répétition automatique sur les actions qui modifient le disque).
+Les boutons (dont `[Haut] TRUC (dossier parent)`, en premier) sont aussi cliquables à la souris.
+Maintenir une lettre, `↑` ou `Suppr` n'agit qu'une fois (pas de répétition automatique sur les
+actions qui modifient le disque). Le déplacement vers le parent s'annule avec `Z` comme les autres.
+Il n'y a pas de bouton parent si le dossier trié est une racine de disque (`C:\`).
+
+## Fenêtre
+
+Au lancement, ImageSort retrouve l'état de la fenêtre du dernier lancement : plein écran ou non,
+fenêtre agrandie ou non, et sinon sa taille et sa position. Au tout premier lancement, c'est le plein écran.
+`F11` bascule entre plein écran et fenêtre ; en revenant en fenêtre, on retrouve la dernière taille
+et position de fenêtre. Un emplacement qui serait hors des écrans actuels (écran débranché) est ignoré.
+
+Le réglage est global (le même quel que soit le dossier trié), dans
+`%APPDATA%\ImageSort\settings.txt` (fichier texte `clé=valeur`) ; le supprimer rétablit le plein écran.
 
 Si un fichier du même nom existe déjà dans le répertoire cible, l'image est renommée
 (`photo_1.jpg`) — rien n'est jamais écrasé.
@@ -67,5 +80,6 @@ cargo test --release --lib -- --ignored --nocapture bench_decode   # mesure de v
 ```
 
 Organisation : `session.rs` (déplacement / suppression / annulation), `prefetch.rs` (préchargement),
-`decode.rs` (décodage + réduction), `scan.rs`, `hotkeys.rs`, `natural.rs`, `view.rs`, `app.rs` (egui),
+`decode.rs` (décodage + réduction), `scan.rs`, `hotkeys.rs`, `natural.rs`, `view.rs`, `settings.rs`
+(taille de la fenêtre), `app.rs` (egui),
 `tests/ui_flow.rs` (scénarios clavier de bout en bout).

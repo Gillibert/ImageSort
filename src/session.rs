@@ -47,6 +47,8 @@ pub enum SessionError {
     NoImage,
     /// Numéro de répertoire cible inconnu.
     NoSuchTarget,
+    /// Le dossier trié n'a pas de dossier parent (racine de disque).
+    NoParent,
     /// Le fichier courant a disparu du disque (il est retiré de la liste).
     SourceMissing(PathBuf),
     /// Annulation impossible : l'emplacement d'origine est occupé.
@@ -59,6 +61,7 @@ impl fmt::Display for SessionError {
         match self {
             SessionError::NoImage => write!(f, "aucune image"),
             SessionError::NoSuchTarget => write!(f, "répertoire inconnu"),
+            SessionError::NoParent => write!(f, "pas de dossier parent"),
             SessionError::SourceMissing(p) => write!(f, "fichier disparu : {}", p.display()),
             SessionError::OriginOccupied(p) => {
                 write!(f, "annulation impossible, {} existe déjà", p.display())
@@ -96,8 +99,17 @@ pub struct Session {
     images: Vec<PathBuf>,
     current: usize,
     targets: Vec<Target>,
+    parent: Option<Target>,
     undo: Vec<Action>,
     trash: Box<dyn Trash>,
+}
+
+/// Dossier parent de `root` (chemin absolu, sans résoudre les liens), avec son nom d'affichage.
+fn parent_target(root: &Path) -> Option<Target> {
+    let abs = std::path::absolute(root).ok()?;
+    let parent = abs.parent()?.to_path_buf();
+    let name = parent.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| parent.display().to_string());
+    parent.is_dir().then_some(Target { name, path: parent })
 }
 
 impl Session {
@@ -105,11 +117,16 @@ impl Session {
     pub fn open(root: &Path, trash: Box<dyn Trash>) -> io::Result<Session> {
         let images = scan::list_images(root)?;
         let targets = scan::list_targets(root)?;
-        Ok(Session { root: root.to_path_buf(), images, current: 0, targets, undo: Vec::new(), trash })
+        let parent = parent_target(root);
+        Ok(Session { root: root.to_path_buf(), images, current: 0, targets, parent, undo: Vec::new(), trash })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+    /// Dossier parent du dossier trié, s'il existe (pas pour une racine de disque).
+    pub fn parent(&self) -> Option<&Target> {
+        self.parent.as_ref()
     }
     pub fn targets(&self) -> &[Target] {
         &self.targets
@@ -198,9 +215,20 @@ impl Session {
     /// Déplace l'image courante dans le répertoire cible `target`, puis passe à la suivante.
     /// Retourne le chemin final (renommé en cas de collision de nom).
     pub fn move_to(&mut self, target: usize) -> Result<PathBuf> {
-        let src = self.images.get(self.current).ok_or(SessionError::NoImage)?.clone();
         let dir = self.targets.get(target).ok_or(SessionError::NoSuchTarget)?.path.clone();
-        let dest = unique_destination(&dir, &src);
+        self.move_into(&dir)
+    }
+
+    /// Déplace l'image courante dans le dossier parent du dossier trié (`TRUC` si on trie
+    /// `TRUC/Tosort`), puis passe à la suivante. L'image sort ainsi de la liste de tri.
+    pub fn move_up(&mut self) -> Result<PathBuf> {
+        let dir = self.parent.as_ref().ok_or(SessionError::NoParent)?.path.clone();
+        self.move_into(&dir)
+    }
+
+    fn move_into(&mut self, dir: &Path) -> Result<PathBuf> {
+        let src = self.images.get(self.current).ok_or(SessionError::NoImage)?.clone();
+        let dest = unique_destination(dir, &src);
         if let Err(e) = move_file(&src, &dest) {
             return Err(self.fail_on_source(&src, e));
         }
@@ -577,5 +605,72 @@ mod tests {
         let remaining: Vec<_> = fs::read_dir(&f.root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert!(remaining.contains(&"2.jpg".to_string()));
         assert!(!remaining.contains(&"1.jpg".to_string()));
+    }
+
+    #[test]
+    fn parent_is_the_folder_above_the_sorted_one() {
+        let f = fixture(1);
+        let parent = f.session.parent().expect("a parent");
+        assert_eq!(parent.path, f.root.parent().unwrap());
+        assert_eq!(parent.name, f.root.parent().unwrap().file_name().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn move_up_sends_the_image_to_the_parent_and_shows_the_next_one() {
+        let mut f = fixture(3);
+        let up = f.root.parent().unwrap().to_path_buf();
+        let dest = f.session.move_up().unwrap();
+        assert_eq!(dest, up.join("1.jpg"));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "content1");
+        assert!(!f.root.join("1.jpg").exists());
+        assert_eq!(names(&f.session), vec!["2.jpg", "3.jpg"]);
+        assert_eq!(f.session.current().unwrap().file_name().unwrap(), "2.jpg");
+    }
+
+    #[test]
+    fn move_up_can_be_undone() {
+        let mut f = fixture(2);
+        let up = f.root.parent().unwrap().to_path_buf();
+        f.session.move_up().unwrap();
+        let undone = f.session.undo().unwrap().unwrap();
+        assert!(matches!(undone, Undone::Moved { .. }));
+        assert!(f.root.join("1.jpg").exists());
+        assert!(!up.join("1.jpg").exists());
+        assert_eq!(names(&f.session), vec!["1.jpg", "2.jpg"]);
+    }
+
+    #[test]
+    fn move_up_never_overwrites_a_file_of_the_parent() {
+        let mut f = fixture(1);
+        let up = f.root.parent().unwrap().to_path_buf();
+        write(up.join("1.jpg"), "already there").unwrap();
+        let dest = f.session.move_up().unwrap();
+        assert_eq!(dest, up.join("1_1.jpg"));
+        assert_eq!(fs::read_to_string(up.join("1.jpg")).unwrap(), "already there");
+    }
+
+    #[test]
+    fn move_up_with_no_image_is_an_error() {
+        let mut f = fixture(0);
+        assert!(matches!(f.session.move_up(), Err(SessionError::NoImage)));
+    }
+
+    #[test]
+    fn move_up_without_parent_is_an_error() {
+        let mut f = fixture(1);
+        f.session.parent = None;
+        assert!(matches!(f.session.move_up(), Err(SessionError::NoParent)));
+        assert!(f.root.join("1.jpg").exists());
+    }
+
+    #[test]
+    fn parent_of_a_relative_path_and_of_a_drive_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel = parent_target(Path::new("some_folder")).expect("parent of a relative path");
+        assert_eq!(rel.path, cwd);
+        let dot = parent_target(Path::new(".")).expect("parent of the current folder");
+        assert_eq!(dot.path, cwd.parent().unwrap());
+        #[cfg(windows)]
+        assert!(parent_target(Path::new("C:\\")).is_none());
     }
 }

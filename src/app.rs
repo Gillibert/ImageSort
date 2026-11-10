@@ -4,9 +4,10 @@ use crate::decode::decode_fit;
 use crate::hotkeys::{self, Hotkey};
 use crate::prefetch::Prefetcher;
 use crate::session::{Session, SessionError, Undone};
+use crate::settings::{ViewState, WindowSettings};
 use crate::view::fit_rect;
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, TextureHandle, TextureOptions, Vec2};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,54 @@ pub struct Loaded {
     orig: (u32, u32),
 }
 
+/// Textes affichés par l'interface. Les polices intégrées d'egui n'ont pas les flèches
+/// (← → ↑ s'affichent en carré) : on n'en utilise pas, et un test vérifie que chaque
+/// caractère de ces textes existe dans les polices.
+pub mod texts {
+    pub const HELP: &str = "Gauche / Droite : naviguer   ·   lettre : déplacer   ·   Haut : dossier parent   ·   Z : annuler   ·   Suppr : corbeille   ·   Tab : barre   ·   F11 : plein écran   ·   Échap : quitter";
+    pub const LOADING: &str = "Chargement…";
+    pub const NO_IMAGE: &str = "Aucune image. Créez des sous-répertoires dans le dossier à trier.";
+    pub const ALL_SORTED: &str = "Tout est trié !  (Z pour annuler)";
+    pub const NO_SUBFOLDER: &str = "Aucun sous-répertoire : créez-en dans le dossier à trier (Alice, Bob…).";
+
+    pub fn moved(name: &str) -> String {
+        format!("Déplacée dans {name}")
+    }
+    pub fn moved_up(name: &str) -> String {
+        format!("Déplacée dans {name} (dossier parent)")
+    }
+    pub fn parent_button(name: &str) -> String {
+        format!("[Haut]  {name} (dossier parent)")
+    }
+    pub fn dimensions(w: u32, h: u32) -> String {
+        format!("   {w}×{h}")
+    }
+    pub fn info(file: &str, index: usize, len: usize, dims: &str, undo: usize) -> String {
+        format!("{file}   {index} / {len}{dims}   (annuler : {undo})")
+    }
+
+    /// Tous les textes (avec des exemples pour les parties variables), pour le test de couverture des polices.
+    pub fn all_samples() -> Vec<String> {
+        vec![
+            HELP.into(),
+            LOADING.into(),
+            NO_IMAGE.into(),
+            ALL_SORTED.into(),
+            NO_SUBFOLDER.into(),
+            moved("Alice/Bob"),
+            moved_up("TRUC"),
+            parent_button("TRUC"),
+            info("photo.jpg", 3, 120, &dimensions(4032, 3024), 2),
+            "Supprimée (corbeille)".into(),
+            "Rien à annuler".into(),
+            "Annulé : photo.jpg revient de Alice".into(),
+            "Annulé : photo.jpg restaurée".into(),
+            "Image illisible : format non reconnu".into(),
+            "Erreur : fichier disparu".into(),
+        ]
+    }
+}
+
 /// Actions déclenchées par le clavier ou la souris.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cmd {
@@ -27,6 +76,8 @@ enum Cmd {
     First,
     Last,
     MoveTo(usize),
+    /// Vers le dossier parent du dossier trié.
+    MoveUp,
     Delete,
     Undo,
     ToggleBar,
@@ -53,6 +104,19 @@ pub struct SorterApp {
     forward: bool,
     show_bar: bool,
     status: Option<Status>,
+    /// Mémorisation de la taille/position de la fenêtre (inactive tant qu'on n'a pas appelé `remember_window`).
+    window: Option<WindowMemory>,
+}
+
+/// Délai avant d'écrire sur le disque un changement de taille/position de la fenêtre
+/// (évite d'écrire à chaque image d'un redimensionnement à la souris).
+const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+struct WindowMemory {
+    path: PathBuf,
+    settings: WindowSettings,
+    /// Moment du premier changement non encore écrit.
+    dirty_since: Option<Instant>,
 }
 
 impl SorterApp {
@@ -89,7 +153,56 @@ impl SorterApp {
             .filter_map(|(i, h)| h.and_then(|h| Key::from_name(&h.label())).map(|k| (k, i)))
             .collect();
 
-        SorterApp { session, prefetch, target_px, hotkeys, key_map, forward: true, show_bar: true, status: None }
+        SorterApp { session, prefetch, target_px, hotkeys, key_map, forward: true, show_bar: true, status: None, window: None }
+    }
+
+    /// Active la mémorisation de la taille/position de la fenêtre dans `path`
+    /// (`initial` : réglages déjà lus au lancement).
+    pub fn remember_window(&mut self, path: PathBuf, initial: WindowSettings) {
+        self.window = Some(WindowMemory { path, settings: initial, dirty_since: None });
+    }
+
+    /// Réglages de fenêtre actuellement retenus (pour les tests).
+    pub fn window_settings(&self) -> Option<&WindowSettings> {
+        self.window.as_ref().map(|w| &w.settings)
+    }
+
+    /// Écrit tout de suite les réglages de fenêtre (à la fermeture). Les erreurs sont ignorées :
+    /// ne pas pouvoir mémoriser la taille ne doit jamais gêner le tri.
+    pub fn save_window_now(&mut self) {
+        if let Some(w) = &mut self.window {
+            let _ = w.settings.save(&w.path);
+            w.dirty_since = None;
+        }
+    }
+
+    /// Suit la taille/position de la fenêtre ; écrit les changements après un court délai.
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.window else { return };
+        let view = ctx.input(|i| {
+            let vp = i.viewport();
+            ViewState {
+                fullscreen: vp.fullscreen,
+                maximized: vp.maximized,
+                minimized: vp.minimized,
+                inner: vp.inner_rect.map(|r| (r.width(), r.height())),
+                outer_min: vp.outer_rect.map(|r| (r.min.x, r.min.y)),
+                monitor: vp.monitor_size.map(|s| (s.x, s.y)),
+                ppp: vp.native_pixels_per_point,
+            }
+        });
+        if w.settings.observe(&view) && w.dirty_since.is_none() {
+            w.dirty_since = Some(Instant::now());
+        }
+        if let Some(since) = w.dirty_since {
+            let age = since.elapsed();
+            if age >= SAVE_DELAY {
+                let _ = w.settings.save(&w.path);
+                w.dirty_since = None;
+            } else {
+                ctx.request_repaint_after(SAVE_DELAY - age);
+            }
+        }
     }
 
     pub fn session(&self) -> &Session {
@@ -146,6 +259,7 @@ impl SorterApp {
                     Key::Z => cmds.push(Cmd::Undo),
                     // Actions qui modifient le disque : jamais en répétition automatique.
                     _ if *repeat => {}
+                    Key::ArrowUp => cmds.push(Cmd::MoveUp),
                     Key::Home => cmds.push(Cmd::First),
                     Key::End => cmds.push(Cmd::Last),
                     Key::Delete => cmds.push(Cmd::Delete),
@@ -186,7 +300,17 @@ impl SorterApp {
                 match self.session.move_to(i) {
                     Ok(_) => {
                         self.forward = true;
-                        self.set_status(format!("→ {name}"), false)
+                        self.set_status(texts::moved(&name), false)
+                    }
+                    Err(e) => self.report(e),
+                }
+            }
+            Cmd::MoveUp => {
+                let name = self.session.parent().map(|t| t.name.clone()).unwrap_or_default();
+                match self.session.move_up() {
+                    Ok(_) => {
+                        self.forward = true;
+                        self.set_status(texts::moved_up(&name), false)
                     }
                     Err(e) => self.report(e),
                 }
@@ -211,6 +335,18 @@ impl SorterApp {
             Cmd::ToggleFullscreen => {
                 let fs = ctx.input(|i| i.viewport().fullscreen).unwrap_or(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+                // Sortie du plein écran : on retrouve la taille/position mémorisées (si l'appli a démarré
+                // en plein écran, la fenêtre ne les connaît pas).
+                if fs {
+                    if let Some(w) = &self.window {
+                        if let Some((sw, sh)) = w.settings.size {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(sw, sh)));
+                        }
+                        if let Some((x, y)) = w.settings.startup_position() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(x, y)));
+                        }
+                    }
+                }
             }
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -255,12 +391,17 @@ impl eframe::App for SorterApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 1.0]
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_window_now();
+    }
 }
 
 impl SorterApp {
     /// Traite les entrées clavier et met à jour le préchargement (avant le dessin).
     pub fn step(&mut self, ctx: &egui::Context) {
         self.sync_target_size(ctx);
+        self.track_window(ctx);
         for cmd in self.read_commands(ctx) {
             self.apply(ctx, cmd);
         }
@@ -282,9 +423,9 @@ impl SorterApp {
         match self.session.current() {
             None => {
                 if self.session.targets().is_empty() {
-                    centered("Aucune image. Créez des sous-répertoires dans le dossier à trier.", Color32::GRAY);
+                    centered(texts::NO_IMAGE, Color32::GRAY);
                 } else {
-                    centered("Tout est trié !  (Z pour annuler)", Color32::from_rgb(140, 230, 150));
+                    centered(texts::ALL_SORTED, Color32::from_rgb(140, 230, 150));
                 }
             }
             Some(path) => match self.prefetch.get(path) {
@@ -301,7 +442,7 @@ impl SorterApp {
                     }
                 },
                 None => {
-                    centered("Chargement…", Color32::GRAY);
+                    centered(texts::LOADING, Color32::GRAY);
                     self.draw_info(&painter, screen, path, None);
                 }
             },
@@ -310,23 +451,23 @@ impl SorterApp {
         self.draw_status(&ctx, &painter, screen);
 
         if self.show_bar {
-            if let Some(i) = self.draw_bar(&ctx, screen) {
-                self.apply(&ctx, Cmd::MoveTo(i));
+            if let Some(cmd) = self.draw_bar(&ctx, screen) {
+                self.apply(&ctx, cmd);
             }
         }
     }
 
     fn draw_info(&self, painter: &egui::Painter, screen: Rect, path: &Path, orig: Option<(u32, u32)>) {
-        let dims = orig.map(|(w, h)| format!("   {w}×{h}")).unwrap_or_default();
-        let text = format!("{}   {} / {}{}   (annuler : {})", file_name(path), self.session.index() + 1, self.session.len(), dims, self.session.undo_len());
+        let dims = orig.map(|(w, h)| texts::dimensions(w, h)).unwrap_or_default();
+        let text = texts::info(&file_name(path), self.session.index() + 1, self.session.len(), &dims, self.session.undo_len());
         let galley = painter.layout_no_wrap(text, FontId::proportional(18.0), Color32::from_gray(225));
         let pos = screen.min + Vec2::new(16.0, 14.0);
         painter.rect_filled(Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(8.0, 4.0)), 6, Color32::from_black_alpha(150));
         painter.galley(pos, galley, Color32::from_gray(225));
     }
 
-    /// Barre de boutons en bas de l'écran. Retourne le répertoire cliqué, le cas échéant.
-    fn draw_bar(&self, ctx: &egui::Context, screen: Rect) -> Option<usize> {
+    /// Barre de boutons en bas de l'écran. Retourne l'action demandée par un clic, le cas échéant.
+    fn draw_bar(&self, ctx: &egui::Context, screen: Rect) -> Option<Cmd> {
         let mut clicked = None;
         egui::Area::new(egui::Id::unique("target_bar"))
             .order(egui::Order::Foreground)
@@ -335,9 +476,20 @@ impl SorterApp {
                 egui::Frame::new().fill(Color32::from_black_alpha(205)).corner_radius(10).inner_margin(10).show(ui, |ui| {
                     ui.set_max_width((screen.width() - 48.0).max(200.0));
                     if self.session.targets().is_empty() {
-                        ui.label(RichText::new("Aucun sous-répertoire : créez-en dans le dossier à trier (Alice, Bob…).").size(18.0));
+                        ui.label(RichText::new(texts::NO_SUBFOLDER).size(18.0));
                     }
                     ui.horizontal_wrapped(|ui| {
+                        if let Some(parent) = self.session.parent() {
+                            let label = texts::parent_button(&parent.name);
+                            let resp = ui.add(egui::Button::new(RichText::new(label).size(20.0)).min_size(Vec2::new(0.0, 36.0)));
+                            if resp.clicked() {
+                                clicked = Some(Cmd::MoveUp);
+                            }
+                            if resp.has_focus() {
+                                resp.surrender_focus();
+                            }
+                            ui.separator();
+                        }
                         for (i, t) in self.session.targets().iter().enumerate() {
                             let label = match self.hotkeys[i] {
                                 Some(k) => format!("[{}]  {}", k.label(), t.name),
@@ -345,7 +497,7 @@ impl SorterApp {
                             };
                             let resp = ui.add(egui::Button::new(RichText::new(label).size(20.0)).min_size(Vec2::new(0.0, 36.0)));
                             if resp.clicked() {
-                                clicked = Some(i);
+                                clicked = Some(Cmd::MoveTo(i));
                             }
                             // Pas de focus clavier sur les boutons : Espace/Entrée/flèches restent à l'application.
                             if resp.has_focus() {
@@ -355,7 +507,7 @@ impl SorterApp {
                     });
                     ui.add_space(2.0);
                     ui.label(
-                        RichText::new("← → naviguer   ·   lettre = déplacer   ·   Z annuler   ·   Suppr corbeille   ·   Tab barre   ·   F11 plein écran   ·   Échap quitter")
+                        RichText::new(texts::HELP)
                             .size(14.0)
                             .color(Color32::from_gray(150)),
                     );
